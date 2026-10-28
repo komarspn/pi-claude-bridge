@@ -6,6 +6,7 @@ import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/res
 import { Text } from "@earendil-works/pi-tui";
 import { createSession, deleteSession, openSession, repairToolPairing } from "cc-session-io";
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { appendFileSync, mkdirSync, realpathSync, statSync } from "fs";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
@@ -1062,6 +1063,11 @@ function resolveMcpTools(context: Context, excludeToolName?: string): {
 	return { mcpTools, customToolNameToSdk, customToolNameToPi };
 }
 
+function snapshotToolDefinitions(tools: Tool[]): NonNullable<QueryContext["toolDefinitions"]> {
+	return new Map(tools.map(({ name, description, parameters }) =>
+		[name, structuredClone({ description, parameters })]));
+}
+
 // Creates an MCP server that bridges pi tools to the SDK. Each tool handler
 // blocks on a Promise until pi delivers the tool result via streamSimple.
 // Handlers receive their toolCallId from Claude's tools/call _meta, so results
@@ -1743,7 +1749,7 @@ const CONTINUE_AFTER_RESUME_PROMPT =
 	+ "you were waiting for. Continue the task from there.]";
 
 /** Drop a Claude Code query parked at a tool boundary whose conversation pi has
- *  since rewritten (/compact, tree navigation).
+ *  since rewritten (/compact, tree navigation), or whose tool definitions changed.
  *
  *  Delivering the turn's tool result into that query hands Claude Code the
  *  context pi just shrank: one pi turn is one CC query, and the query keeps its
@@ -1758,7 +1764,7 @@ const CONTINUE_AFTER_RESUME_PROMPT =
  *  rewritten history — this tool result included, since it is already in that
  *  history — so the turn continues instead of ending here. Nothing is lost by
  *  killing the subprocess: pi owns the only copy of the conversation that counts. */
-function discardRewrittenQuery(c: QueryContext): void {
+function discardRewrittenQuery(c: QueryContext, reason = "conversation rewritten"): void {
 	const discarded = c.activeQuery as { interrupt?: () => Promise<unknown>; close?: () => void } | null;
 	if (discarded) abandonedQueries.add(discarded);
 	c.activeQuery = null;
@@ -1766,11 +1772,11 @@ function discardRewrittenQuery(c: QueryContext): void {
 	// contextForToolResults only matches ids against contexts still in it.
 	activeQueryContexts.delete(c);
 	c.turnToolCallIds = [];
-	c.promptStream?.fail(new Error("conversation rewritten"));
+	c.promptStream?.fail(new Error(reason));
 	c.promptStream = null;
 	// Settle the parked handlers before killing the CLI, for drainForAbort's
 	// reason: one left awaiting a dead subprocess never settles.
-	c.releasePendingToolCalls("Context was compacted; this query was discarded.");
+	c.releasePendingToolCalls(`Query discarded: ${reason}.`);
 	void discarded?.interrupt?.().catch(() => {});
 	try { discarded?.close?.(); } catch {}
 	// The CLI we just killed may still flush a record into the session JSONL, and
@@ -1780,7 +1786,7 @@ function discardRewrittenQuery(c: QueryContext): void {
 	const state = sessionStateFor(c.piSessionId);
 	if (state) setSessionStateFor(c.piSessionId, { ...state, needsRebuild: true, forceRotate: true });
 	if (c.piSessionId) historyRewrittenBySession.delete(c.piSessionId);
-	debug("provider: history rewritten under a parked query — discarded it, rebuilding from current history");
+	debug(`provider: ${reason} under a parked query — discarded it, rebuilding from current history`);
 }
 
 /** Provider entry point. Pi calls this for each new prompt and each tool result.
@@ -1816,9 +1822,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// The staleness mark is per pi session: a subagent's compaction (its own
 	// AgentSession, sharing this process) must not discard the parent's parked
 	// query, and vice versa.
+	const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context, askClaudeToolName);
+	const toolDefinitions = snapshotToolDefinitions(mcpTools);
+	const toolsChanged = Boolean(resultCtx?.toolDefinitions && !isDeepStrictEqual(resultCtx.toolDefinitions, toolDefinitions));
 	const rewrittenUnderQuery = Boolean(resultCtx?.historyStale);
-	if (resultCtx && rewrittenUnderQuery) {
-		discardRewrittenQuery(resultCtx);
+	if (resultCtx && (rewrittenUnderQuery || toolsChanged)) {
+		discardRewrittenQuery(resultCtx, rewrittenUnderQuery ? "conversation rewritten" : "tool definitions changed");
 		resultCtx = undefined;
 		// Recomputed, not cleared: a reentrant subagent may still hold a query of its own.
 		activeQuery = ctx().activeQuery !== null;
@@ -1872,7 +1881,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// falls through to the fresh-query path, which resumes the CC session and
 	// delivers it.
 	const lastMsg = context.messages[context.messages.length - 1];
-	const unparkedToolResult = lastMsg?.role === "toolResult" && !rewrittenUnderQuery;
+	const unparkedToolResult = lastMsg?.role === "toolResult" && !rewrittenUnderQuery && !toolsChanged;
 	if (unparkedToolResult && options?.signal?.aborted) {
 		debug(`provider: orphaned tool result after abort, emitting end_turn`);
 		// With no query in flight anywhere, the top-level session this result
@@ -1906,7 +1915,6 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// Resolved first: an unaccountable system prompt fails this query before anything
 	// is claimed or reset, leaving no half-built query behind — in particular no stream
 	// claimed on the shared context that nobody will ever end.
-	const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context, askClaudeToolName);
 	// Build from what Pi loaded for this run, so `--no-context-files` and
 	// `--no-skills` reach Claude Code by leaving nothing to forward. A sub-agent's
 	// custom override embeds its parent's assembled Pi prompt; recursive projection
@@ -1965,6 +1973,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	// first tool result would sit on armed staleness again (the mark is consumed
 	// from the set, not from here) and re-discard a healthy query.
 	queryCtx.historyStale = false;
+	queryCtx.toolDefinitions = toolDefinitions;
 	queryCtx.missedSteer = false;
 
 	const cwd = sessionCwdFor(options?.sessionId);
@@ -1994,7 +2003,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		promptText = CONTINUE_AFTER_REWRITE_PROMPT;
 		debug(`provider: continuing the turn after a rewritten history, ${context.messages.length} msgs rebuilt`);
 	}
-	if (unparkedToolResult && !promptText && !promptBlocks) {
+	if ((unparkedToolResult || toolsChanged) && !promptText && !promptBlocks) {
 		promptText = CONTINUE_AFTER_RESUME_PROMPT;
 		debug(`provider: resuming the turn at a tool result with no parked query, ${context.messages.length} msgs`);
 	}

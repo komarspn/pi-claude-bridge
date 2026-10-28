@@ -15,6 +15,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { openSession } from "cc-session-io";
 
 const claudeDir = mkdtempSync(join(tmpdir(), "claude-bridge-orphan-restart-cc-"));
 process.env.CLAUDE_CONFIG_DIR = claudeDir;
@@ -35,9 +36,9 @@ const calls = [];
 const scripts = [];
 const init = (id) => ({ type: "system", subtype: "init", session_id: id });
 const ev = (event) => ({ type: "stream_event", event });
-const toolUse = (id) => [
+const toolUse = (id, name = "read") => [
 	ev({ type: "message_start", message: { id: `msg_${id}`, usage: {} } }),
-	ev({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id, name: "mcp__custom-tools__read", input: {} } }),
+	ev({ type: "content_block_start", index: 0, content_block: { type: "tool_use", id, name: `mcp__custom-tools__${name}`, input: {} } }),
 	ev({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: '{"path":"a"}' } }),
 	ev({ type: "content_block_stop", index: 0 }),
 	ev({ type: "message_delta", delta: { stop_reason: "tool_use" }, usage: {} }),
@@ -71,13 +72,14 @@ beforeEach(() => {
 	setQuery(({ prompt, options }) => {
 		const script = scripts.shift();
 		if (!script) throw new Error("no fake script queued");
-		const call = { label: script.label, resume: options.resume };
+		const call = { label: script.label, resume: options.resume, options };
 		calls.push(call);
 		// close() is how the bridge kills CC on abort; it ends a parked script.
 		let closed = false, onClose;
 		const killed = new Promise((r) => { onClose = r; });
 		const gen = (async function* () {
 			call.prompt = (await prompt[Symbol.asyncIterator]().next()).value.message.content[0].text;
+			if (script.inspect) await script.inspect(call);
 			for (const step of script.steps) {
 				if (closed) return;
 				if (typeof step === "function") { await step(killed); continue; }
@@ -90,7 +92,115 @@ beforeEach(() => {
 	});
 });
 
-afterEach(() => setQuery(null));
+afterEach(() => {
+	for (const c of activeQueryContexts) {
+		c.activeQuery?.close();
+		c.releasePendingToolCalls("test ended");
+	}
+	setQuery(null);
+});
+
+async function mcpClient(server) {
+	const pending = new Map();
+	const transport = {
+		start: async () => {}, close: async () => {},
+		send: async (msg) => pending.get(msg.id)?.(msg),
+	};
+	await server.instance.connect(transport);
+	let id = 0;
+	return (method, params) => new Promise((resolve) => {
+		pending.set(++id, resolve);
+		transport.onmessage({ jsonrpc: "2.0", id, method, params });
+	});
+}
+
+const readTool = () => ({ name: "read", description: "Read a file", parameters: { type: "object", properties: { path: { type: "string" } } } });
+
+describe("mid-turn tool activation", () => {
+	it("exposes newly enabled tools without another user message and imports the result once", async () => {
+		const loader = { name: "subagents_enable", description: "Enable subagents", parameters: { type: "object", properties: {} } };
+		const worker = { name: "subagent", description: "Run a subagent", parameters: { type: "object", properties: {} } };
+		const ask = user("enable and run a subagent");
+		scripts.push({ label: "loader", steps: [init("cc-loader"), ...toolUse("enable_1", loader.name), (killed) => killed] });
+		const parked = await streamSimple(model, { messages: [ask], tools: [loader] }, { sessionId: "pi-dynamic" }).result();
+		assert.equal(parked.content[0].name, "subagents_enable");
+		const completed = { ...toolResult("enable_1"), toolName: loader.name, content: [{ type: "text", text: "subagents enabled" }] };
+		scripts.push({ label: "updated", inspect: async (call) => {
+			const request = await mcpClient(call.options.mcpServers["custom-tools"]);
+			assert.deepEqual((await request("tools/list", {})).result.tools.map((t) => t.name), ["subagents_enable", "subagent"]);
+			const session = openSession({ sessionId: call.resume, projectPath: call.options.cwd });
+			const results = session.messages.flatMap((m) => Array.isArray(m.message?.content) ? m.message.content : [])
+				.filter((b) => b.type === "tool_result" && b.tool_use_id === "enable_1");
+			assert.equal(results.length, 1, "the enabling result must appear exactly once in rebuilt history");
+		}, steps: [init("cc-updated"), ...toolUse("worker_1", worker.name), (killed) => killed] });
+
+		const next = streamSimple(model, { messages: [ask, parked, completed], tools: [loader, worker] }, { sessionId: "pi-dynamic" });
+		assert.equal(calls.length, 2, "changed tools must start an updated query in this same turn");
+		const reply = await next.result();
+		assert.equal(reply.content[0].name, "subagent");
+	});
+
+	for (const change of ["remove", "description", "schema"]) {
+		it(`refreshes tools after a ${change} change, including in-place edits`, async () => {
+			const tool = readTool();
+			const ask = user("read a");
+			scripts.push({ label: "old", steps: [init("cc-old"), ...toolUse("change_1"), (killed) => killed] });
+			const parked = await streamSimple(model, { messages: [ask], tools: [tool] }, { sessionId: "pi-change" }).result();
+			if (change === "description") tool.description = "Read updated content";
+			if (change === "schema") tool.parameters.properties.path = { type: "integer" };
+			const tools = change === "remove" ? [] : [tool];
+			scripts.push({ label: "new", inspect: async (call) => {
+				if (change === "remove") assert.equal(call.options.mcpServers, undefined);
+				else {
+					const request = await mcpClient(call.options.mcpServers["custom-tools"]);
+					const [listed] = (await request("tools/list", {})).result.tools;
+					assert.equal(listed.description, tool.description);
+					assert.deepEqual(listed.inputSchema, tool.parameters);
+				}
+			}, steps: [init("cc-new"), ...text("continued"), result("continued")] });
+			const next = streamSimple(model, { messages: [ask, parked, toolResult("change_1")], tools }, { sessionId: "pi-change" });
+			assert.equal(calls.length, 2);
+			assert.equal(replyText(await next.result()), "continued");
+		});
+	}
+
+	it("reuses unchanged definitions despite tool and schema key ordering", async () => {
+		const tools = [readTool(), { name: "write", description: "Write", parameters: { type: "object", properties: {} } }];
+		const ask = user("read a");
+		let response;
+		scripts.push({ label: "reuse", inspect: async (call) => {
+			const request = await mcpClient(call.options.mcpServers["custom-tools"]);
+			response = request("tools/call", { name: "read", arguments: {}, _meta: { "claudecode/toolUseId": "same_1" } });
+		}, steps: [init("cc-reuse"), ...toolUse("same_1"), async () => {
+			assert.equal((await response).result.content[0].text, "file");
+		}, ...text("same query"), result("same query")] });
+		const parked = await streamSimple(model, { messages: [ask], tools }, { sessionId: "pi-reuse" }).result();
+		const reordered = [tools[1], { ...readTool(), parameters: { properties: { path: { type: "string" } }, type: "object" } }];
+		const reply = await streamSimple(model, { messages: [ask, parked, toolResult("same_1")], tools: reordered }, { sessionId: "pi-reuse" }).result();
+		assert.equal(calls.length, 1, "unchanged tools must preserve the running query");
+		assert.equal(replyText(reply), "same query");
+	});
+
+	it("refreshes a child without discarding its concurrently parked parent", async () => {
+		const tools = [readTool()];
+		const parentAsk = user("parent task");
+		let parentResponse;
+		scripts.push({ label: "parent", inspect: async (call) => {
+			const request = await mcpClient(call.options.mcpServers["custom-tools"]);
+			parentResponse = request("tools/call", { name: "read", arguments: {}, _meta: { "claudecode/toolUseId": "parent_1" } });
+		}, steps: [init("cc-parent"), ...toolUse("parent_1"), async () => { await parentResponse; }, ...text("parent done"), result("parent done")] });
+		const parent = await streamSimple(model, { messages: [parentAsk], tools }, { sessionId: "pi-parent" }).result();
+		const childAsk = user("child task");
+		scripts.push({ label: "child", steps: [init("cc-child"), ...toolUse("child_1"), (killed) => killed] });
+		const child = await streamSimple(model, { messages: [childAsk], tools }, { sessionId: "pi-child" }).result();
+		scripts.push({ label: "child-updated", steps: [init("cc-child-updated"), ...text("child done"), result("child done")] });
+		const childReply = await streamSimple(model, { messages: [childAsk, child, toolResult("child_1")], tools: [] }, { sessionId: "pi-child" }).result();
+		assert.equal(replyText(childReply), "child done");
+		const parentReply = await streamSimple(model, { messages: [parentAsk, parent, toolResult("parent_1")], tools }, { sessionId: "pi-parent" }).result();
+		assert.equal(replyText(parentReply), "parent done");
+		assert.deepEqual(calls.map((c) => c.label), ["parent", "child", "child-updated"]);
+	});
+});
 
 describe("tool result with no parked query", () => {
 	it("after a restart, starts a fresh query that answers the turn", async () => {

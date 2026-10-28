@@ -19,6 +19,8 @@ export interface PendingToolCall {
 export class QueryContext {
 	// Query-scoped (fully isolated per query)
 	activeQuery: unknown | null = null;
+	/** Snapshot of the MCP definitions exposed when this query started. */
+	toolDefinitions: Map<string, { description: string; parameters: unknown }> | null = null;
 	currentPiStream: AssistantMessageEventStream | null = null;
 	/** onResponse from the provider call that owns currentPiStream. */
 	currentOnResponse: SimpleStreamOptions["onResponse"] | undefined;
