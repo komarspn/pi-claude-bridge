@@ -27,7 +27,6 @@ let providerConfig;
 mod.default({
 	on: () => {},
 	registerProvider: (_name, config) => { providerConfig = config; },
-	registerTool: () => {},
 });
 const streamSimple = providerConfig.streamSimple;
 const model = providerConfig.models[0];
@@ -78,12 +77,17 @@ beforeEach(() => {
 		let closed = false, onClose;
 		const killed = new Promise((r) => { onClose = r; });
 		const gen = (async function* () {
-			call.prompt = (await prompt[Symbol.asyncIterator]().next()).value.message.content[0].text;
+			const first = (await prompt[Symbol.asyncIterator]().next()).value;
+			call.prompt = first.message.content[0].text;
+			const sessionId = options.sessionId ?? options.resume;
 			if (script.inspect) await script.inspect(call);
 			for (const step of script.steps) {
 				if (closed) return;
 				if (typeof step === "function") { await step(killed); continue; }
-				yield step;
+				if (step.type === "system" && step.subtype === "init") {
+					yield { ...step, session_id: sessionId };
+					yield { ...first, isReplay: true, session_id: sessionId };
+				} else yield step;
 			}
 		})();
 		gen.interrupt = async () => {};
@@ -128,15 +132,15 @@ describe("mid-turn tool activation", () => {
 		scripts.push({ label: "updated", inspect: async (call) => {
 			const request = await mcpClient(call.options.mcpServers["custom-tools"]);
 			assert.deepEqual((await request("tools/list", {})).result.tools.map((t) => t.name), ["subagents_enable", "subagent"]);
-			const session = openSession({ sessionId: call.resume, projectPath: call.options.cwd });
+			const session = openSession({ sessionId: call.options.sessionId ?? call.resume, projectPath: call.options.cwd });
 			const results = session.messages.flatMap((m) => Array.isArray(m.message?.content) ? m.message.content : [])
 				.filter((b) => b.type === "tool_result" && b.tool_use_id === "enable_1");
 			assert.equal(results.length, 1, "the enabling result must appear exactly once in rebuilt history");
 		}, steps: [init("cc-updated"), ...toolUse("worker_1", worker.name), (killed) => killed] });
 
 		const next = streamSimple(model, { messages: [ask, parked, completed], tools: [loader, worker] }, { sessionId: "pi-dynamic" });
-		assert.equal(calls.length, 2, "changed tools must start an updated query in this same turn");
 		const reply = await next.result();
+		assert.equal(calls.length, 2, "changed tools must start an updated query in this same turn");
 		assert.equal(reply.content[0].name, "subagent");
 	});
 
@@ -159,8 +163,8 @@ describe("mid-turn tool activation", () => {
 				}
 			}, steps: [init("cc-new"), ...text("continued"), result("continued")] });
 			const next = streamSimple(model, { messages: [ask, parked, toolResult("change_1")], tools }, { sessionId: "pi-change" });
-			assert.equal(calls.length, 2);
 			assert.equal(replyText(await next.result()), "continued");
+			assert.equal(calls.length, 2);
 		});
 	}
 
